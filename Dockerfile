@@ -32,5 +32,8 @@ COPY --from=builder /usr/local/bin/notion-mcp-server /usr/local/bin/notion-mcp-s
 # Set default environment variables
 ENV OPENAPI_MCP_HEADERS="{}"
 
-# Set entrypoint
-ENTRYPOINT ["notion-mcp-server"]
+# Expose the HTTP port
+EXPOSE 3000
+
+# Set entrypoint — run in HTTP transport mode for remote hosting
+ENTRYPOINT ["notion-mcp-server", "--transport", "http", "--port", "3000"]

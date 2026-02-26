@@ -168,7 +168,17 @@ Examples:
             }
           }
 
-          const proxy = await initProxy(specPath, baseUrl)
+          // Multi-tenant: extract per-user Notion token from request headers
+          const notionToken = req.headers['x-notion-token'] as string | undefined
+          let perSessionHeaders: Record<string, string> | undefined
+          if (notionToken) {
+            perSessionHeaders = {
+              'Authorization': `Bearer ${notionToken}`,
+              'Notion-Version': '2025-09-03',
+            }
+          }
+
+          const proxy = await initProxy(specPath, baseUrl, perSessionHeaders)
           await proxy.connect(transport)
         } else {
           // Invalid request
