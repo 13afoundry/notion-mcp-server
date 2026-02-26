@@ -5,6 +5,12 @@ primary_region = "fra"
 
 [env]
   PORT = "3000"
+  TOKEN_STORE_PATH = "/data/tokens.json"
+  PUBLIC_URL = "https://nulegal-notion-mcp.fly.dev"
+
+[mounts]
+  source = "notion_mcp_data"
+  destination = "/data"
 
 [http_service]
   internal_port = 3000
