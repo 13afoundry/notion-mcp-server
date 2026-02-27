@@ -4,13 +4,17 @@ import { fileURLToPath } from 'url'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
-import { randomUUID, randomBytes, createHash } from 'node:crypto'
+import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto'
 import express from 'express'
 
 import { initProxy, ValidationError } from '../src/init-server'
 
-// ── Token store for OAuth-issued user keys ──────────────────────────
-// Maps userKey -> { notionToken, workspaceName, botId, owner }
+// ── Persistent store ─────────────────────────────────────────────────
+// All state lives in a single JSON file on the Fly.io volume.
+
+const DATA_DIR = process.env.DATA_DIR || '/data'
+const STORE_PATH = path.join(DATA_DIR, 'store.json')
+
 type UserEntry = {
   notionToken: string
   workspaceName?: string
@@ -19,41 +23,138 @@ type UserEntry = {
   createdAt: string
 }
 
-const TOKEN_STORE_PATH = process.env.TOKEN_STORE_PATH || '/data/tokens.json'
+type OAuthClient = {
+  clientId: string
+  clientSecretHash: string
+  clientName: string
+  redirectUris: string[]
+  grantTypes: string[]
+  scope: string
+  createdAt: string
+}
 
-function loadTokenStore(): Record<string, UserEntry> {
-  try {
-    const data = fs.readFileSync(TOKEN_STORE_PATH, 'utf-8')
-    return JSON.parse(data)
-  } catch {
-    return {}
+type AuthCode = {
+  code: string
+  clientId: string
+  redirectUri: string
+  scope: string
+  codeChallenge: string
+  codeChallengeMethod: string
+  userKey: string         // nmc_ key that maps to a Notion token
+  expiresAt: number       // epoch ms
+  used: boolean
+}
+
+type McpAccessToken = {
+  tokenHash: string
+  userKey: string         // nmc_ key
+  clientId: string
+  scope: string
+  expiresAt: number       // epoch ms
+  refreshTokenHash?: string
+}
+
+type Store = {
+  users: Record<string, UserEntry>       // nmc_key -> UserEntry
+  oauthClients: Record<string, OAuthClient> // clientId -> OAuthClient
+  authCodes: Record<string, AuthCode>    // code -> AuthCode
+  mcpTokens: Record<string, McpAccessToken> // tokenHash -> McpAccessToken
+}
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true })
   }
 }
 
-function saveTokenStore(store: Record<string, UserEntry>) {
-  const dir = path.dirname(TOKEN_STORE_PATH)
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true })
+function loadStore(): Store {
+  try {
+    const data = fs.readFileSync(STORE_PATH, 'utf-8')
+    const parsed = JSON.parse(data)
+    return {
+      users: parsed.users || {},
+      oauthClients: parsed.oauthClients || {},
+      authCodes: parsed.authCodes || {},
+      mcpTokens: parsed.mcpTokens || {},
+    }
+  } catch {
+    return { users: {}, oauthClients: {}, authCodes: {}, mcpTokens: {} }
   }
-  fs.writeFileSync(TOKEN_STORE_PATH, JSON.stringify(store, null, 2))
+}
+
+function saveStore(store: Store) {
+  ensureDataDir()
+  fs.writeFileSync(STORE_PATH, JSON.stringify(store, null, 2))
+}
+
+// Migrate old token store format if needed
+function migrateOldTokenStore() {
+  const oldPath = process.env.TOKEN_STORE_PATH || path.join(DATA_DIR, 'tokens.json')
+  if (fs.existsSync(oldPath) && !fs.existsSync(STORE_PATH)) {
+    try {
+      const oldData = JSON.parse(fs.readFileSync(oldPath, 'utf-8'))
+      const store = loadStore()
+      store.users = oldData
+      saveStore(store)
+      console.log(`Migrated ${Object.keys(oldData).length} users from old token store`)
+    } catch (e) {
+      console.error('Failed to migrate old token store:', e)
+    }
+  }
+}
+
+function hashToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex')
 }
 
 function lookupNotionToken(userKey: string): string | undefined {
-  const store = loadTokenStore()
-  return store[userKey]?.notionToken
+  const store = loadStore()
+  return store.users[userKey]?.notionToken
 }
+
+// Look up a Notion token from an MCP access token (issued via OAuth 2.1)
+function lookupNotionTokenFromMcpToken(bearerToken: string): string | undefined {
+  const store = loadStore()
+  const hash = hashToken(bearerToken)
+  const mcpToken = store.mcpTokens[hash]
+  if (!mcpToken) return undefined
+  if (mcpToken.expiresAt < Date.now()) return undefined
+  return store.users[mcpToken.userKey]?.notionToken
+}
+
+// ── Pending OAuth states (in-memory, transient) ──────────────────────
+// Tracks the OAuth 2.1 authorize → Notion OAuth → callback chain.
+type PendingOAuthState = {
+  clientId: string
+  redirectUri: string
+  codeChallenge: string
+  codeChallengeMethod: string
+  scope: string
+  state?: string
+  createdAt: number
+}
+const pendingOAuthStates: Record<string, PendingOAuthState> = {}
+
+// Clean up expired states every 5 minutes
+setInterval(() => {
+  const now = Date.now()
+  for (const [key, val] of Object.entries(pendingOAuthStates)) {
+    if (now - val.createdAt > 10 * 60 * 1000) delete pendingOAuthStates[key]
+  }
+}, 5 * 60 * 1000)
+
+// ── Server ───────────────────────────────────────────────────────────
 
 export async function startServer(args: string[] = process.argv) {
   const filename = fileURLToPath(import.meta.url)
   const directory = path.dirname(filename)
   const specPath = path.resolve(directory, '../scripts/notion-openapi.json')
-  
+
   const baseUrl = process.env.BASE_URL ?? undefined
 
-  // Parse command line arguments manually (similar to slack-mcp approach)
   function parseArgs() {
     const args = process.argv.slice(2);
-    let transport = 'stdio'; // default
+    let transport = 'stdio';
     let port = 3000;
     let authToken: string | undefined;
     let disableAuth = false;
@@ -61,13 +162,13 @@ export async function startServer(args: string[] = process.argv) {
     for (let i = 0; i < args.length; i++) {
       if (args[i] === '--transport' && i + 1 < args.length) {
         transport = args[i + 1];
-        i++; // skip next argument
+        i++;
       } else if (args[i] === '--port' && i + 1 < args.length) {
         port = parseInt(args[i + 1], 10);
-        i++; // skip next argument
+        i++;
       } else if (args[i] === '--auth-token' && i + 1 < args.length) {
         authToken = args[i + 1];
-        i++; // skip next argument
+        i++;
       } else if (args[i] === '--disable-auth') {
         disableAuth = true;
       } else if (args[i] === '--help' || args[i] === '-h') {
@@ -76,28 +177,13 @@ Usage: notion-mcp-server [options]
 
 Options:
   --transport <type>     Transport type: 'stdio' or 'http' (default: stdio)
-  --port <number>        Port for HTTP server when using Streamable HTTP transport (default: 3000)
-  --auth-token <token>   Bearer token for HTTP transport authentication (optional)
-  --disable-auth         Disable bearer token authentication for HTTP transport
+  --port <number>        Port for HTTP server (default: 3000)
+  --auth-token <token>   Bearer token for admin access (optional)
+  --disable-auth         Disable authentication entirely
   --help, -h             Show this help message
-
-Environment Variables:
-  NOTION_TOKEN           Notion integration token (recommended)
-  OPENAPI_MCP_HEADERS    JSON string with Notion API headers (alternative)
-  AUTH_TOKEN             Bearer token for HTTP transport authentication (alternative to --auth-token)
-
-Examples:
-  notion-mcp-server                                    # Use stdio transport (default)
-  notion-mcp-server --transport stdio                  # Use stdio transport explicitly
-  notion-mcp-server --transport http                   # Use Streamable HTTP transport on port 3000
-  notion-mcp-server --transport http --port 8080       # Use Streamable HTTP transport on port 8080
-  notion-mcp-server --transport http --auth-token mytoken # Use Streamable HTTP transport with custom auth token
-  notion-mcp-server --transport http --disable-auth    # Use Streamable HTTP transport without authentication
-  AUTH_TOKEN=mytoken notion-mcp-server --transport http # Use Streamable HTTP transport with auth token from env var
 `);
         process.exit(0);
       }
-      // Ignore unrecognized arguments (like command name passed by Docker)
     }
 
     return { transport: transport.toLowerCase(), port, authToken, disableAuth };
@@ -107,26 +193,31 @@ Examples:
   const transport = options.transport
 
   if (transport === 'stdio') {
-    // Use stdio transport (default)
     const proxy = await initProxy(specPath, baseUrl)
     await proxy.connect(new StdioServerTransport())
     return proxy.getServer()
   } else if (transport === 'http') {
-    // Use Streamable HTTP transport
+    // Migrate old token store on startup
+    migrateOldTokenStore()
+
     const app = express()
     app.use(express.json())
+    app.use(express.urlencoded({ extended: true }))
 
-    // Generate or use provided auth token (from CLI arg or env var) only if auth is enabled
+    // Admin auth token (for direct API access + legacy nmc_ keys)
     let authToken: string | undefined
     if (!options.disableAuth) {
       authToken = options.authToken || process.env.AUTH_TOKEN || randomBytes(32).toString('hex')
       if (!options.authToken && !process.env.AUTH_TOKEN) {
         console.log(`Generated auth token: ${authToken}`)
-        console.log(`Use this token in the Authorization header: Bearer ${authToken}`)
       }
     }
 
-    // Health endpoint (no authentication required)
+    const PUBLIC_URL = process.env.PUBLIC_URL || `https://nulegal-notion-mcp.fly.dev`
+    const NOTION_CLIENT_ID = process.env.NOTION_OAUTH_CLIENT_ID
+    const NOTION_CLIENT_SECRET = process.env.NOTION_OAUTH_CLIENT_SECRET
+
+    // ── Health endpoint ────────────────────────────────────────────
     app.get('/health', (req, res) => {
       res.status(200).json({
         status: 'healthy',
@@ -136,20 +227,451 @@ Examples:
       })
     })
 
-    // ── Notion OAuth flow ──────────────────────────────────────────
-    const NOTION_CLIENT_ID = process.env.NOTION_OAUTH_CLIENT_ID
-    const NOTION_CLIENT_SECRET = process.env.NOTION_OAUTH_CLIENT_SECRET
-    const PUBLIC_URL = process.env.PUBLIC_URL || `https://nulegal-notion-mcp.fly.dev`
+    // ── OAuth 2.1 Discovery (RFC 9728 + RFC 8414) ─────────────────
 
+    // Protected Resource Metadata (RFC 9728)
+    app.get('/.well-known/oauth-protected-resource', (req, res) => {
+      res.json({
+        resource: PUBLIC_URL,
+        authorization_servers: [PUBLIC_URL],
+        scopes_supported: ['read', 'write'],
+        bearer_methods_supported: ['header'],
+      })
+    })
+
+    // Authorization Server Metadata (RFC 8414)
+    app.get('/.well-known/oauth-authorization-server', (req, res) => {
+      res.json({
+        issuer: PUBLIC_URL,
+        authorization_endpoint: `${PUBLIC_URL}/oauth/authorize`,
+        token_endpoint: `${PUBLIC_URL}/oauth/token`,
+        registration_endpoint: `${PUBLIC_URL}/oauth/register`,
+        response_types_supported: ['code'],
+        grant_types_supported: ['authorization_code', 'refresh_token'],
+        token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic', 'none'],
+        scopes_supported: ['read', 'write'],
+        code_challenge_methods_supported: ['S256'],
+      })
+    })
+
+    // ── Dynamic Client Registration (RFC 7591) ────────────────────
+
+    app.post('/oauth/register', (req, res) => {
+      const { client_name, redirect_uris, grant_types, scope } = req.body
+
+      if (!redirect_uris || !Array.isArray(redirect_uris) || redirect_uris.length === 0) {
+        res.status(400).json({ error: 'invalid_client_metadata', error_description: 'redirect_uris required' })
+        return
+      }
+
+      // Validate redirect URIs (must be HTTPS, or HTTP for localhost)
+      for (const uri of redirect_uris) {
+        try {
+          const parsed = new URL(uri)
+          if (parsed.protocol === 'http:' && !['localhost', '127.0.0.1'].includes(parsed.hostname)) {
+            res.status(400).json({ error: 'invalid_redirect_uri', error_description: `Non-HTTPS URI not allowed: ${uri}` })
+            return
+          }
+        } catch {
+          res.status(400).json({ error: 'invalid_redirect_uri', error_description: `Invalid URI: ${uri}` })
+          return
+        }
+      }
+
+      const clientId = randomUUID()
+      const rawSecret = randomBytes(32).toString('base64url')
+
+      const store = loadStore()
+      store.oauthClients[clientId] = {
+        clientId,
+        clientSecretHash: hashToken(rawSecret),
+        clientName: client_name || 'Unknown Client',
+        redirectUris: redirect_uris,
+        grantTypes: grant_types || ['authorization_code', 'refresh_token'],
+        scope: scope || 'read write',
+        createdAt: new Date().toISOString(),
+      }
+      saveStore(store)
+
+      console.log(`Registered OAuth client: ${clientId} (${client_name || 'Unknown'})`)
+
+      res.status(201).json({
+        client_id: clientId,
+        client_secret: rawSecret,
+        client_name: client_name || 'Unknown Client',
+        redirect_uris,
+        grant_types: grant_types || ['authorization_code', 'refresh_token'],
+        scope: scope || 'read write',
+      })
+    })
+
+    // ── OAuth Authorize Endpoint ──────────────────────────────────
+    // Claude.ai redirects the user here. We chain to Notion OAuth.
+
+    app.get('/oauth/authorize', (req, res) => {
+      const {
+        client_id,
+        redirect_uri,
+        response_type,
+        scope,
+        state,
+        code_challenge,
+        code_challenge_method,
+      } = req.query as Record<string, string>
+
+      if (response_type !== 'code') {
+        res.status(400).json({ error: 'unsupported_response_type' })
+        return
+      }
+
+      if (!code_challenge) {
+        res.status(400).json({ error: 'invalid_request', error_description: 'PKCE code_challenge required' })
+        return
+      }
+
+      if (code_challenge_method && code_challenge_method !== 'S256') {
+        res.status(400).json({ error: 'invalid_request', error_description: 'Only S256 code_challenge_method supported' })
+        return
+      }
+
+      // Validate client
+      const store = loadStore()
+      const client = store.oauthClients[client_id]
+      if (!client) {
+        res.status(400).json({ error: 'invalid_client', error_description: 'Unknown client_id' })
+        return
+      }
+
+      if (!client.redirectUris.includes(redirect_uri)) {
+        res.status(400).json({ error: 'invalid_request', error_description: 'redirect_uri not registered' })
+        return
+      }
+
+      if (!NOTION_CLIENT_ID || !NOTION_CLIENT_SECRET) {
+        res.status(500).json({ error: 'server_error', error_description: 'Notion OAuth not configured' })
+        return
+      }
+
+      // Generate a state token to track this OAuth flow through Notion
+      const oauthStateKey = randomBytes(24).toString('base64url')
+      pendingOAuthStates[oauthStateKey] = {
+        clientId: client_id,
+        redirectUri: redirect_uri,
+        codeChallenge: code_challenge,
+        codeChallengeMethod: code_challenge_method || 'S256',
+        scope: scope || 'read write',
+        state,
+        createdAt: Date.now(),
+      }
+
+      // Redirect to Notion OAuth — user will authorize Notion access
+      const notionRedirectUri = `${PUBLIC_URL}/oauth/notion-callback`
+      const notionAuthUrl = `https://api.notion.com/v1/oauth/authorize?client_id=${NOTION_CLIENT_ID}&response_type=code&owner=user&redirect_uri=${encodeURIComponent(notionRedirectUri)}&state=${oauthStateKey}`
+
+      res.redirect(notionAuthUrl)
+    })
+
+    // ── Notion OAuth Callback (chained from /oauth/authorize) ─────
+    // Notion redirects here after user authorizes. We exchange the
+    // Notion code, store the token, create an MCP auth code, and
+    // redirect back to Claude.ai's callback.
+
+    app.get('/oauth/notion-callback', async (req, res) => {
+      const notionCode = req.query.code as string | undefined
+      const oauthStateKey = req.query.state as string | undefined
+      const error = req.query.error as string | undefined
+
+      if (error || !notionCode || !oauthStateKey) {
+        res.status(400).send(`<h2>Authorization failed</h2><p>${error || 'Missing code or state'}</p>`)
+        return
+      }
+
+      const pending = pendingOAuthStates[oauthStateKey]
+      if (!pending) {
+        res.status(400).send('<h2>Invalid or expired authorization request</h2>')
+        return
+      }
+      delete pendingOAuthStates[oauthStateKey]
+
+      try {
+        // Exchange Notion code for Notion access token
+        const notionRedirectUri = `${PUBLIC_URL}/oauth/notion-callback`
+        const basicAuth = Buffer.from(`${NOTION_CLIENT_ID}:${NOTION_CLIENT_SECRET}`).toString('base64')
+
+        const tokenRes = await fetch('https://api.notion.com/v1/oauth/token', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Basic ${basicAuth}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            grant_type: 'authorization_code',
+            code: notionCode,
+            redirect_uri: notionRedirectUri,
+          }),
+        })
+
+        if (!tokenRes.ok) {
+          const errBody = await tokenRes.text()
+          console.error('Notion token exchange failed:', errBody)
+          res.status(500).send(`<h2>Notion token exchange failed</h2><pre>${errBody}</pre>`)
+          return
+        }
+
+        const tokenData = await tokenRes.json() as {
+          access_token: string
+          workspace_name?: string
+          bot_id?: string
+          owner?: { user?: { name?: string; person?: { email?: string } } }
+        }
+
+        // Store the Notion token under an nmc_ key
+        const userKey = `nmc_${randomBytes(24).toString('hex')}`
+        const store = loadStore()
+        const ownerName = tokenData.owner?.user?.name || tokenData.owner?.user?.person?.email || 'unknown'
+        store.users[userKey] = {
+          notionToken: tokenData.access_token,
+          workspaceName: tokenData.workspace_name,
+          botId: tokenData.bot_id,
+          owner: ownerName,
+          createdAt: new Date().toISOString(),
+        }
+
+        // Create an MCP authorization code
+        const mcpCode = randomBytes(32).toString('base64url')
+        store.authCodes[mcpCode] = {
+          code: mcpCode,
+          clientId: pending.clientId,
+          redirectUri: pending.redirectUri,
+          scope: pending.scope,
+          codeChallenge: pending.codeChallenge,
+          codeChallengeMethod: pending.codeChallengeMethod,
+          userKey,
+          expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
+          used: false,
+        }
+        saveStore(store)
+
+        console.log(`OAuth flow complete for ${ownerName} (workspace: ${tokenData.workspace_name})`)
+
+        // Redirect back to Claude.ai with the authorization code
+        const redirectUrl = new URL(pending.redirectUri)
+        redirectUrl.searchParams.set('code', mcpCode)
+        if (pending.state) {
+          redirectUrl.searchParams.set('state', pending.state)
+        }
+
+        res.redirect(redirectUrl.toString())
+      } catch (err) {
+        console.error('OAuth notion-callback error:', err)
+        res.status(500).send(`<h2>Something went wrong</h2><pre>${err}</pre>`)
+      }
+    })
+
+    // ── OAuth Token Endpoint ──────────────────────────────────────
+    // Claude.ai exchanges the authorization code for an access token.
+
+    app.post('/oauth/token', async (req, res) => {
+      // Support both form-encoded and JSON
+      const grant_type = req.body.grant_type
+      const code = req.body.code
+      const redirect_uri = req.body.redirect_uri
+      const code_verifier = req.body.code_verifier
+      const refresh_token = req.body.refresh_token
+
+      // Extract client credentials (from body or Basic auth header)
+      let clientId = req.body.client_id as string | undefined
+      let clientSecret = req.body.client_secret as string | undefined
+
+      const authHeader = req.headers['authorization']
+      if (authHeader?.startsWith('Basic ')) {
+        try {
+          const decoded = Buffer.from(authHeader.slice(6), 'base64').toString()
+          const [hId, hSecret] = decoded.split(':', 2)
+          if (hId) clientId = hId
+          if (hSecret) clientSecret = hSecret
+        } catch { /* ignore malformed */ }
+      }
+
+      if (!clientId) {
+        res.status(400).json({ error: 'invalid_request', error_description: 'client_id required' })
+        return
+      }
+
+      const store = loadStore()
+      const client = store.oauthClients[clientId]
+      if (!client) {
+        res.status(401).json({ error: 'invalid_client' })
+        return
+      }
+
+      // Validate client secret (if provided — public clients may not send one)
+      if (clientSecret) {
+        const providedHash = hashToken(clientSecret)
+        if (providedHash !== client.clientSecretHash) {
+          res.status(401).json({ error: 'invalid_client' })
+          return
+        }
+      }
+
+      if (grant_type === 'authorization_code') {
+        if (!code || !redirect_uri) {
+          res.status(400).json({ error: 'invalid_request', error_description: 'code and redirect_uri required' })
+          return
+        }
+
+        const authCode = store.authCodes[code]
+        if (!authCode) {
+          res.status(400).json({ error: 'invalid_grant', error_description: 'Invalid authorization code' })
+          return
+        }
+
+        if (authCode.used) {
+          delete store.authCodes[code]
+          saveStore(store)
+          res.status(400).json({ error: 'invalid_grant', error_description: 'Code already used' })
+          return
+        }
+
+        if (authCode.clientId !== clientId) {
+          res.status(400).json({ error: 'invalid_grant' })
+          return
+        }
+
+        if (authCode.redirectUri !== redirect_uri) {
+          res.status(400).json({ error: 'invalid_grant' })
+          return
+        }
+
+        if (authCode.expiresAt < Date.now()) {
+          delete store.authCodes[code]
+          saveStore(store)
+          res.status(400).json({ error: 'invalid_grant', error_description: 'Code expired' })
+          return
+        }
+
+        // PKCE verification
+        if (code_verifier) {
+          const expectedChallenge = createHash('sha256')
+            .update(code_verifier)
+            .digest('base64url')
+
+          if (expectedChallenge !== authCode.codeChallenge) {
+            console.error('PKCE verification failed')
+            res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' })
+            return
+          }
+        } else if (authCode.codeChallenge) {
+          // PKCE was used in authorize but verifier not provided
+          res.status(400).json({ error: 'invalid_request', error_description: 'code_verifier required' })
+          return
+        }
+
+        // Mark code as used
+        authCode.used = true
+
+        // Issue MCP access token + refresh token
+        const rawAccessToken = randomBytes(48).toString('base64url')
+        const rawRefreshToken = randomBytes(48).toString('base64url')
+        const accessHash = hashToken(rawAccessToken)
+        const refreshHash = hashToken(rawRefreshToken)
+
+        store.mcpTokens[accessHash] = {
+          tokenHash: accessHash,
+          userKey: authCode.userKey,
+          clientId,
+          scope: authCode.scope,
+          expiresAt: Date.now() + 3600 * 1000, // 1 hour
+          refreshTokenHash: refreshHash,
+        }
+
+        // Clean up used code
+        delete store.authCodes[code]
+        saveStore(store)
+
+        console.log(`Issued MCP access token for user key ${authCode.userKey.slice(0, 12)}...`)
+
+        res.json({
+          access_token: rawAccessToken,
+          token_type: 'Bearer',
+          expires_in: 3600,
+          refresh_token: rawRefreshToken,
+          scope: authCode.scope,
+        })
+        return
+      }
+
+      if (grant_type === 'refresh_token') {
+        if (!refresh_token) {
+          res.status(400).json({ error: 'invalid_request', error_description: 'refresh_token required' })
+          return
+        }
+
+        const refreshHash = hashToken(refresh_token)
+
+        // Find the token with this refresh hash
+        let oldToken: McpAccessToken | undefined
+        let oldHash: string | undefined
+        for (const [hash, token] of Object.entries(store.mcpTokens)) {
+          if (token.refreshTokenHash === refreshHash) {
+            oldToken = token
+            oldHash = hash
+            break
+          }
+        }
+
+        if (!oldToken || !oldHash) {
+          res.status(400).json({ error: 'invalid_grant' })
+          return
+        }
+
+        if (oldToken.clientId !== clientId) {
+          res.status(400).json({ error: 'invalid_client' })
+          return
+        }
+
+        // Issue new tokens (rotation)
+        const rawAccessToken = randomBytes(48).toString('base64url')
+        const rawRefreshToken = randomBytes(48).toString('base64url')
+        const newAccessHash = hashToken(rawAccessToken)
+        const newRefreshHash = hashToken(rawRefreshToken)
+
+        store.mcpTokens[newAccessHash] = {
+          tokenHash: newAccessHash,
+          userKey: oldToken.userKey,
+          clientId,
+          scope: oldToken.scope,
+          expiresAt: Date.now() + 3600 * 1000,
+          refreshTokenHash: newRefreshHash,
+        }
+
+        // Delete old token
+        delete store.mcpTokens[oldHash]
+        saveStore(store)
+
+        console.log(`Refreshed MCP token for user key ${oldToken.userKey.slice(0, 12)}...`)
+
+        res.json({
+          access_token: rawAccessToken,
+          token_type: 'Bearer',
+          expires_in: 3600,
+          refresh_token: rawRefreshToken,
+          scope: oldToken.scope,
+        })
+        return
+      }
+
+      res.status(400).json({ error: 'unsupported_grant_type' })
+    })
+
+    // ── Legacy Notion OAuth (direct, for Cursor/Claude Code) ──────
     if (NOTION_CLIENT_ID && NOTION_CLIENT_SECRET) {
-      // Step 1: Redirect to Notion OAuth
       app.get('/auth/notion', (req, res) => {
         const redirectUri = `${PUBLIC_URL}/auth/notion/callback`
         const url = `https://api.notion.com/v1/oauth/authorize?client_id=${NOTION_CLIENT_ID}&response_type=code&owner=user&redirect_uri=${encodeURIComponent(redirectUri)}`
         res.redirect(url)
       })
 
-      // Step 2: Handle callback, exchange code for token, issue user key
       app.get('/auth/notion/callback', async (req, res) => {
         const code = req.query.code as string | undefined
         const error = req.query.error as string | undefined
@@ -160,7 +682,6 @@ Examples:
         }
 
         try {
-          // Exchange code for access token
           const redirectUri = `${PUBLIC_URL}/auth/notion/callback`
           const basicAuth = Buffer.from(`${NOTION_CLIENT_ID}:${NOTION_CLIENT_SECRET}`).toString('base64')
 
@@ -191,23 +712,18 @@ Examples:
             owner?: { user?: { name?: string; person?: { email?: string } } }
           }
 
-          // Generate a unique user key
           const userKey = `nmc_${randomBytes(24).toString('hex')}`
-
-          // Store the mapping
-          const store = loadTokenStore()
+          const store = loadStore()
           const ownerName = tokenData.owner?.user?.name || tokenData.owner?.user?.person?.email || 'unknown'
-          store[userKey] = {
+          store.users[userKey] = {
             notionToken: tokenData.access_token,
             workspaceName: tokenData.workspace_name,
             botId: tokenData.bot_id,
             owner: ownerName,
             createdAt: new Date().toISOString(),
           }
-          saveTokenStore(store)
+          saveStore(store)
 
-          // Show the user their config
-          const serverAuthToken = authToken || '<SERVER_AUTH_TOKEN>'
           res.send(`<!DOCTYPE html>
 <html><head><title>Notion MCP — Connected!</title>
 <style>
@@ -239,9 +755,7 @@ Examples:
 }</pre>
   <div class="warn">
     <strong>Keep your key private.</strong> It grants access to your Notion workspace through this server.
-    Your personal key starts with <code>nmc_</code>.
   </div>
-  <p>That's it — no other setup needed. The server handles everything.</p>
 </body></html>`)
         } catch (err) {
           console.error('OAuth callback error:', err)
@@ -249,39 +763,51 @@ Examples:
         }
       })
 
-      console.log(`Notion OAuth enabled: ${PUBLIC_URL}/auth/notion`)
+      console.log(`Notion OAuth (direct): ${PUBLIC_URL}/auth/notion`)
     }
 
-    // ── Auth middleware (supports admin token + OAuth user keys) ────
+    // ── MCP Auth Middleware ────────────────────────────────────────
+    // Supports: admin token, nmc_ keys, and OAuth 2.1 bearer tokens.
+    // Returns 401 with WWW-Authenticate for Claude.ai OAuth discovery.
+
     const authenticateAndResolveToken = (req: express.Request, res: express.Response, next: express.NextFunction): void => {
       const authHeader = req.headers['authorization']
-      const token = authHeader && authHeader.split(' ')[1] // Bearer TOKEN
+      const token = authHeader && authHeader.split(' ')[1]
 
       if (!token) {
-        res.status(401).json({
-          jsonrpc: '2.0',
-          error: { code: -32001, message: 'Unauthorized: Missing bearer token' },
-          id: null,
-        })
+        // Return 401 with resource_metadata for OAuth 2.1 discovery
+        res.status(401)
+          .set('WWW-Authenticate', `Bearer resource_metadata="${PUBLIC_URL}/.well-known/oauth-protected-resource"`)
+          .json({
+            jsonrpc: '2.0',
+            error: { code: -32001, message: 'Unauthorized: Bearer token required' },
+            id: null,
+          })
         return
       }
 
-      // Check if it's the admin/shared auth token
+      // 1. Admin token
       if (authToken && token === authToken) {
-        // Admin token — Notion token must come via X-Notion-Token header
         next()
         return
       }
 
-      // Check if it's an OAuth-issued user key (starts with nmc_)
+      // 2. Legacy nmc_ user key (from /auth/notion direct flow)
       if (token.startsWith('nmc_')) {
         const notionToken = lookupNotionToken(token)
         if (notionToken) {
-          // Inject the Notion token into the request for downstream use
           req.headers['x-notion-token'] = notionToken
           next()
           return
         }
+      }
+
+      // 3. MCP OAuth 2.1 access token
+      const notionToken = lookupNotionTokenFromMcpToken(token)
+      if (notionToken) {
+        req.headers['x-notion-token'] = notionToken
+        next()
+        return
       }
 
       res.status(403).json({
@@ -291,42 +817,35 @@ Examples:
       })
     }
 
-    // Apply authentication to all /mcp routes only if auth is enabled
+    // Apply auth to /mcp routes
     if (!options.disableAuth) {
       app.use('/mcp', authenticateAndResolveToken)
     }
 
-    // Map to store transports by session ID
+    // ── MCP Transport ─────────────────────────────────────────────
     const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {}
 
-    // Handle POST requests for client-to-server communication
     app.post('/mcp', async (req, res) => {
       try {
-        // Check for existing session ID
         const sessionId = req.headers['mcp-session-id'] as string | undefined
         let transport: StreamableHTTPServerTransport
 
         if (sessionId && transports[sessionId]) {
-          // Reuse existing transport
           transport = transports[sessionId]
         } else if (!sessionId && isInitializeRequest(req.body)) {
-          // New initialization request
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (sessionId) => {
-              // Store the transport by session ID
               transports[sessionId] = transport
             }
           })
 
-          // Clean up transport when closed
           transport.onclose = () => {
             if (transport.sessionId) {
               delete transports[transport.sessionId]
             }
           }
 
-          // Multi-tenant: extract per-user Notion token from request headers
           const notionToken = req.headers['x-notion-token'] as string | undefined
           let perSessionHeaders: Record<string, string> | undefined
           if (notionToken) {
@@ -339,75 +858,58 @@ Examples:
           const proxy = await initProxy(specPath, baseUrl, perSessionHeaders)
           await proxy.connect(transport)
         } else {
-          // Invalid request
           res.status(400).json({
             jsonrpc: '2.0',
-            error: {
-              code: -32000,
-              message: 'Bad Request: No valid session ID provided',
-            },
+            error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
             id: null,
           })
           return
         }
 
-        // Handle the request
         await transport.handleRequest(req, res, req.body)
       } catch (error) {
         console.error('Error handling MCP request:', error)
         if (!res.headersSent) {
           res.status(500).json({
             jsonrpc: '2.0',
-            error: {
-              code: -32603,
-              message: 'Internal server error',
-            },
+            error: { code: -32603, message: 'Internal server error' },
             id: null,
           })
         }
       }
     })
 
-    // Handle GET requests for server-to-client notifications via Streamable HTTP
     app.get('/mcp', async (req, res) => {
       const sessionId = req.headers['mcp-session-id'] as string | undefined
       if (!sessionId || !transports[sessionId]) {
         res.status(400).send('Invalid or missing session ID')
         return
       }
-      
-      const transport = transports[sessionId]
-      await transport.handleRequest(req, res)
+      await transports[sessionId].handleRequest(req, res)
     })
 
-    // Handle DELETE requests for session termination
     app.delete('/mcp', async (req, res) => {
       const sessionId = req.headers['mcp-session-id'] as string | undefined
       if (!sessionId || !transports[sessionId]) {
         res.status(400).send('Invalid or missing session ID')
         return
       }
-      
-      const transport = transports[sessionId]
-      await transport.handleRequest(req, res)
+      await transports[sessionId].handleRequest(req, res)
     })
 
+    // ── Start ─────────────────────────────────────────────────────
     const port = options.port
     app.listen(port, '0.0.0.0', () => {
       console.log(`MCP Server listening on port ${port}`)
-      console.log(`Endpoint: http://0.0.0.0:${port}/mcp`)
-      console.log(`Health check: http://0.0.0.0:${port}/health`)
-      if (options.disableAuth) {
-        console.log(`Authentication: Disabled`)
-      } else {
-        console.log(`Authentication: Bearer token required`)
-        if (options.authToken) {
-          console.log(`Using provided auth token`)
-        }
+      console.log(`Endpoint: ${PUBLIC_URL}/mcp`)
+      console.log(`Health: ${PUBLIC_URL}/health`)
+      console.log(`OAuth metadata: ${PUBLIC_URL}/.well-known/oauth-authorization-server`)
+      if (NOTION_CLIENT_ID) {
+        console.log(`OAuth authorize: ${PUBLIC_URL}/oauth/authorize`)
+        console.log(`Direct auth: ${PUBLIC_URL}/auth/notion`)
       }
     })
 
-    // Return a dummy server for compatibility
     return { close: () => {} }
   } else {
     throw new Error(`Unsupported transport: ${transport}. Use 'stdio' or 'http'.`)
